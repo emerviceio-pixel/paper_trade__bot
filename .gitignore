@@ -1,0 +1,32 @@
+# Virtual Environment
+venv/
+env/
+.env
+*.pyc
+
+# Logs
+logs/*.log
+*.log
+
+# Data files
+data/*.csv
+*.csv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+dist/
+build/
+*.egg-info/
