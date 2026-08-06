@@ -52,7 +52,7 @@ PAPER_INITIAL_BALANCE = float(os.getenv('PAPER_INITIAL_BALANCE', 10.0))
 PAPER_TRADE_LOG = Path(__file__).parent / 'data' / 'paper_trades.json'
 PAPER_PNL_LOG = Path(__file__).parent / 'data' / 'paper_pnl.csv'
 
-# --- PAPER TRADING STATE ---
+# --- PAPER TRADING STATE ----
 class PaperTradingState:
     """Maintains paper trading state (position, P&L, history)"""
     def __init__(self, initial_balance=PAPER_INITIAL_BALANCE):
