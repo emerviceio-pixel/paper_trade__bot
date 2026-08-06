@@ -7,9 +7,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from decimal import Decimal
+from collections import deque
 
 # Add project root to path
-sys.path.append(str(Path(__file__).parent.parent))
+sys.path.append(str(Path(__file__).parent))
 
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
@@ -19,7 +20,7 @@ from loguru import logger
 
 logger.remove()  # Remove default handler
 logger.add(
-    "logs/trading.log",
+    "logs/paper_trading.log",
     rotation="1 day",
     retention="30 days",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
@@ -32,7 +33,7 @@ logger.add(
 )
 
 # Load environment variables
-env_path = Path(__file__).parent.parent / 'config' / '.env'
+env_path = Path(__file__).parent / '.env'
 load_dotenv(env_path)
 
 # --- CONFIGURATION ---
@@ -46,9 +47,187 @@ MAX_SPREAD = float(os.getenv('MAX_SPREAD', 0.0015))
 TARGET_PERCENT = 0.0015  # 0.15%
 STOP_PERCENT = 0.0012    # 0.12%
 
+# --- PAPER TRADING CONFIGURATION ---
+PAPER_INITIAL_BALANCE = float(os.getenv('PAPER_INITIAL_BALANCE', 10.0))
+PAPER_TRADE_LOG = Path(__file__).parent / 'data' / 'paper_trades.json'
+PAPER_PNL_LOG = Path(__file__).parent / 'data' / 'paper_pnl.csv'
 
-# --- WEBSOCKET BOT ---
-class WebSocketTradingBot:
+# --- PAPER TRADING STATE ---
+class PaperTradingState:
+    """Maintains paper trading state (position, P&L, history)"""
+    def __init__(self, initial_balance=PAPER_INITIAL_BALANCE):
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.position = 0.0  # Current position size (positive = long, negative = short)
+        self.entry_price = 0.0
+        self.current_price = 0.0
+        self.trades = []  # List of completed trades
+        self.open_trade = None  # Current open trade info
+        self.total_pnl = 0.0
+        self.win_count = 0
+        self.loss_count = 0
+        
+    def open_position(self, side, quantity, entry_price, tp_price, sl_price):
+        """Open a paper position"""
+        if self.position != 0:
+            logger.warning("⚠️ Position already open, closing first")
+            self.close_position(entry_price)  # Close at current price
+        
+        self.position = quantity if side == "Buy" else -quantity
+        self.entry_price = entry_price
+        self.current_price = entry_price
+        
+        self.open_trade = {
+            'side': side,
+            'quantity': quantity,
+            'entry_price': entry_price,
+            'tp_price': tp_price,
+            'sl_price': sl_price,
+            'open_time': datetime.utcnow().isoformat(),
+            'status': 'open'
+        }
+        
+        logger.info(f"📊 [PAPER] Opened {side} position: {quantity:.4f} @ {entry_price:.8f}")
+        logger.info(f"   🎯 TP: {tp_price:.8f} | 🛑 SL: {sl_price:.8f}")
+        
+    def close_position(self, exit_price):
+        """Close paper position and calculate P&L"""
+        if self.position == 0 or not self.open_trade:
+            return 0.0
+        
+        # Calculate P&L
+        if self.position > 0:  # Long position
+            pnl = (exit_price - self.entry_price) * self.position
+        else:  # Short position
+            pnl = (self.entry_price - exit_price) * abs(self.position)
+        
+        # Apply leverage to P&L
+        pnl = pnl * LEVERAGE
+        
+        # Update balance
+        self.balance += pnl
+        self.total_pnl += pnl
+        
+        # Update win/loss stats
+        if pnl > 0:
+            self.win_count += 1
+        else:
+            self.loss_count += 1
+        
+        # Record trade
+        trade_record = {
+            **self.open_trade,
+            'exit_price': exit_price,
+            'exit_time': datetime.utcnow().isoformat(),
+            'pnl': pnl,
+            'pnl_percent': (pnl / (self.entry_price * abs(self.position))) * 100 if self.entry_price > 0 else 0,
+            'balance_after': self.balance,
+            'status': 'closed'
+        }
+        self.trades.append(trade_record)
+        
+        logger.info(f"📊 [PAPER] Closed position @ {exit_price:.8f}")
+        logger.info(f"   P&L: ${pnl:.2f} | Balance: ${self.balance:.2f}")
+        
+        # Reset position
+        self.position = 0.0
+        self.entry_price = 0.0
+        self.open_trade = None
+        
+        # Save trade to log
+        self.save_trade(trade_record)
+        
+        return pnl
+    
+    def update_price(self, current_price):
+        """Update current price and check TP/SL"""
+        self.current_price = current_price
+        
+        if self.position == 0 or not self.open_trade:
+            return
+        
+        # Check TP/SL
+        tp_price = self.open_trade['tp_price']
+        sl_price = self.open_trade['sl_price']
+        
+        if self.position > 0:  # Long position
+            if current_price >= tp_price:
+                logger.info(f"🎯 [PAPER] Take Profit hit! Closing long position")
+                self.close_position(tp_price)
+            elif current_price <= sl_price:
+                logger.info(f"🛑 [PAPER] Stop Loss hit! Closing long position")
+                self.close_position(sl_price)
+        else:  # Short position
+            if current_price <= tp_price:
+                logger.info(f"🎯 [PAPER] Take Profit hit! Closing short position")
+                self.close_position(tp_price)
+            elif current_price >= sl_price:
+                logger.info(f"🛑 [PAPER] Stop Loss hit! Closing short position")
+                self.close_position(sl_price)
+    
+    def get_equity(self):
+        """Get current equity (balance + unrealized P&L)"""
+        if self.position == 0:
+            return self.balance
+        
+        # Calculate unrealized P&L
+        if self.position > 0:
+            unrealized_pnl = (self.current_price - self.entry_price) * self.position * LEVERAGE
+        else:
+            unrealized_pnl = (self.entry_price - self.current_price) * abs(self.position) * LEVERAGE
+        
+        return self.balance + unrealized_pnl
+    
+    def save_trade(self, trade_record):
+        """Save trade to JSON log"""
+        PAPER_TRADE_LOG.parent.mkdir(exist_ok=True)
+        
+        # Load existing trades
+        existing_trades = []
+        if PAPER_TRADE_LOG.exists():
+            try:
+                with open(PAPER_TRADE_LOG, 'r') as f:
+                    existing_trades = json.load(f)
+            except:
+                existing_trades = []
+        
+        # Append new trade
+        existing_trades.append(trade_record)
+        
+        # Save back
+        with open(PAPER_TRADE_LOG, 'w') as f:
+            json.dump(existing_trades, f, indent=2)
+    
+    def get_stats(self):
+        """Get trading statistics"""
+        total_trades = len(self.trades)
+        if total_trades == 0:
+            return {
+                'total_trades': 0,
+                'win_rate': 0,
+                'total_pnl': 0,
+                'balance': self.balance,
+                'equity': self.get_equity(),
+                'sharpe': 0
+            }
+        
+        win_rate = (self.win_count / total_trades) * 100
+        pnl_list = [t['pnl'] for t in self.trades]
+        
+        return {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': self.total_pnl,
+            'balance': self.balance,
+            'equity': self.get_equity(),
+            'avg_pnl': np.mean(pnl_list) if pnl_list else 0,
+            'max_pnl': max(pnl_list) if pnl_list else 0,
+            'min_pnl': min(pnl_list) if pnl_list else 0
+        }
+
+
+# --- WEBSOCKET PAPER TRADING BOT ---
+class PaperTradingBot:
     def __init__(self, loop=None):
         self.api_key = os.getenv('BYBIT_API_KEY')
         self.api_secret = os.getenv('BYBIT_SECRET_KEY')
@@ -59,7 +238,7 @@ class WebSocketTradingBot:
         # Capture the primary async event loop running on main thread
         self.loop = loop or asyncio.get_event_loop()
         
-        # HTTP client for placing orders
+        # HTTP client for market data only
         self.session = HTTP(
             testnet=False,
             api_key=self.api_key,
@@ -74,10 +253,6 @@ class WebSocketTradingBot:
         self.best_ask = 0.0
         self.last_update_time = 0
         
-        # Cached balance to eliminate heavy blocking REST API operations
-        self.cached_balance = 0.0
-        self.last_balance_check = 0
-        
         # Price buffer for indicators (last 100 ticks)
         self.price_buffer = []
         self.bid_buffer = []
@@ -88,12 +263,17 @@ class WebSocketTradingBot:
         self.cooldown_until = 0  # Non-blocking timestamp tracking
         self.is_trading = False
         self.last_trade_time = 0
+        self.last_saved_price = 0
+        
+        # Paper trading state
+        self.paper_state = PaperTradingState()
         
         # Threading for concurrent execution
         self.websocket_thread = None
         self.running = False
         
-        logger.info(f"✅ WebSocket bot initialized for {SYMBOL}")
+        logger.info(f"✅ Paper trading bot initialized for {SYMBOL}")
+        logger.info(f"💰 Initial paper balance: ${PAPER_INITIAL_BALANCE:.2f}")
 
     # ============================================
     # WEBSOCKET DATA HANDLERS (Thread-Safe)
@@ -106,7 +286,7 @@ class WebSocketTradingBot:
             if not data:
                 return
             
-            # Extract bids and asks (Handle delta updates where one side might be omitted)
+            # Extract bids and asks
             bids = data.get('b', [])
             asks = data.get('a', [])
             
@@ -131,6 +311,9 @@ class WebSocketTradingBot:
 
                 if len(self.price_buffer) % 10 == 0:  # Save every 10th update
                     self.save_price_data()
+
+                # Update paper state with current price (check TP/SL)
+                self.paper_state.update_price(self.current_price)
 
                 # Thread-safely ship the function call to the primary thread loop context
                 asyncio.run_coroutine_threadsafe(self.on_price_update(), self.loop)
@@ -167,29 +350,12 @@ class WebSocketTradingBot:
             logger.error(f"Trade handler error: {e}")
 
     # ============================================
-    # ASYNC UTILITIES (Non-blocking network wraps)
+    # ASYNC UTILITIES
     # ============================================
     
-    async def async_get_balance(self):
-        """Fetch wallet balance asynchronously using an executor pool"""
-        now = time.time()
-        # Throttle live balance requests to once every 10 seconds max
-        if now - self.last_balance_check < 10 and self.cached_balance > 0:
-            return self.cached_balance
-            
-        try:
-            response = await self.loop.run_in_executor(
-                None, 
-                lambda: self.session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
-            )
-            # Safe layout extraction of totalEquity parameter
-            balance_str = response.get('result', {}).get('list', [{}])[0].get('totalEquity', '0')
-            self.cached_balance = float(balance_str)
-            self.last_balance_check = now
-            return self.cached_balance
-        except Exception as e:
-            logger.error(f"Failed to fetch balance asynchronously: {e}")
-            return self.cached_balance if self.cached_balance > 0 else 0.0
+    async def async_get_paper_balance(self):
+        """Get paper trading balance (non-blocking)"""
+        return self.paper_state.balance
 
     def calculate_rsi(self, period=14):
         """Calculate RSI from price buffer cleanly"""
@@ -211,46 +377,27 @@ class WebSocketTradingBot:
         rs = gains / losses
         return 100.0 - (100.0 / (1 + rs))
 
-    async def execute_trade(self, side, quantity, tp_price, sl_price):
-        """Execute trade using atomic TP/SL parameters via a thread executor"""
+    async def execute_paper_trade(self, side, quantity, tp_price, sl_price):
+        """Execute paper trade without real order placement"""
         try:
-            # 1. Asynchronously wipe old resting tracking orders first
-            await self.loop.run_in_executor(
-                None,
-                lambda: self.session.cancel_all_orders(category="linear", symbol=SYMBOL)
-            )
+            # Check if position already exists
+            if self.paper_state.position != 0:
+                logger.warning("⚠️ Position already open, closing first")
+                self.paper_state.close_position(self.current_price)
             
-            # 2. Build the order execution statement
-            # Attaching takeProfit/stopLoss parameter fields directly executes a secure atomic bracket order
-            order_args = {
-                "category": "linear",
-                "symbol": SYMBOL,
-                "side": side,
-                "orderType": "Market",
-                "qty": str(quantity),
-                "timeInForce": "GTC",
-                "takeProfit": str(tp_price),
-                "stopLoss": str(sl_price),
-                "tpOrderType": "Market",
-                "slOrderType": "Market"
-            }
+            # Open paper position
+            entry_price = self.current_price
+            self.paper_state.open_position(side, quantity, entry_price, tp_price, sl_price)
             
-            entry = await self.loop.run_in_executor(
-                None,
-                lambda: self.session.place_order(**order_args)
-            )
+            self.loss_streak = 0  # Reset streak counter
             
-            if not entry or 'result' not in entry:
-                return False
+            # Log paper trade
+            logger.success(f"✅ [PAPER] Trade executed: {side} {quantity:.4f} @ {entry_price:.8f}")
             
-            logger.info(f"✅ Market Bracket Entry Confirmed! ID: {entry['result'].get('orderId')}")
-            logger.info(f"   🎯 Attached TP: {tp_price} | 🛑 Attached SL: {sl_price}")
-            
-            self.loss_streak = 0  # Reset streak counter loop state
             return True
             
         except Exception as e:
-            logger.error(f"Trade execution error: {e}")
+            logger.error(f"Paper trade execution error: {e}")
             return False
 
     # ============================================
@@ -288,16 +435,16 @@ class WebSocketTradingBot:
                 self.is_trading = False
                 return
             
-            # Fetch balance via non-blocking async wrapper
-            balance = await self.async_get_balance()
+            # Get paper balance
+            balance = await self.async_get_paper_balance()
             if balance < MIN_BALANCE:
-                # ✅ FIXED: Kill the system state switches BEFORE logging
-                self.running = False  # Blocks any future incoming websocket updates
+                # Kill the system state switches BEFORE logging
+                self.running = False
                 
-                logger.critical(f"💀 Balance threshold breached! Account Equity: ${balance:.2f} < Minimum: ${MIN_BALANCE:.2f}. Halting execution system.")
+                logger.critical(f"💀 Paper balance threshold breached! Equity: ${balance:.2f} < Minimum: ${MIN_BALANCE:.2f}. Halting execution system.")
                 
                 if self.ws:
-                    self.ws.exit()  # Clean up and slam down the background websocket sockets
+                    self.ws.exit()
                 return
             
             if self.loss_streak >= LOSS_STREAK_LIMIT:
@@ -344,14 +491,14 @@ class WebSocketTradingBot:
                 self.is_trading = False
                 return
             
-            # Route execution out via thread safe await channel
-            success = await self.execute_trade(side, quantity, tp_price, sl_price)
+            # Execute paper trade
+            success = await self.execute_paper_trade(side, quantity, tp_price, sl_price)
             
             if success:
                 self.last_trade_time = time.time()
-                logger.success(f"✅ Trade executed!")
+                logger.success(f"✅ Paper trade executed!")
             else:
-                logger.error(f"❌ Trade failed!")
+                logger.error(f"❌ Paper trade failed!")
                 self.loss_streak += 1
                 
             self.is_trading = False
@@ -361,7 +508,7 @@ class WebSocketTradingBot:
             self.is_trading = False
 
     # ============================================
-    # PRICE DATA SAVING (ADD THIS INSIDE THE CLASS)
+    # PRICE DATA SAVING
     # ============================================
     
     def save_price_data(self):
@@ -369,9 +516,8 @@ class WebSocketTradingBot:
         import csv
         from pathlib import Path
         
-        csv_file = Path(__file__).parent.parent / 'data' / 'price_history.csv'
+        csv_file = Path(__file__).parent / 'data' / 'paper_price_history.csv'
         csv_file.parent.mkdir(exist_ok=True)
-        self.last_saved_price = 0
         
         file_exists = csv_file.exists()
         
@@ -384,7 +530,7 @@ class WebSocketTradingBot:
             if not file_exists:
                 writer.writerow([
                     'timestamp', 'price', 'bid', 'ask', 'spread',
-                    'bid_volume', 'ask_volume', 'imbalance'  # New columns
+                    'bid_volume', 'ask_volume', 'imbalance'
                 ])
             
             spread = (self.best_ask - self.best_bid) / self.best_bid if self.best_bid > 0 else 0
@@ -403,7 +549,30 @@ class WebSocketTradingBot:
                 bid_volume,
                 ask_volume,
                 imbalance
-            ])       
+            ])
+    
+    def save_paper_stats(self):
+        """Save paper trading statistics to CSV"""
+        import csv
+        
+        stats_file = PAPER_PNL_LOG
+        stats_file.parent.mkdir(exist_ok=True)
+        
+        stats = self.paper_state.get_stats()
+        
+        # Add timestamp
+        stats['timestamp'] = datetime.utcnow().isoformat()
+        stats['current_price'] = self.current_price
+        stats['position'] = self.paper_state.position
+        stats['entry_price'] = self.paper_state.entry_price
+        
+        file_exists = stats_file.exists()
+        
+        with open(stats_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=stats.keys())
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(stats)
 
     # ============================================
     # WEBSOCKET CONNECTION MANAGEMENT
@@ -420,7 +589,7 @@ class WebSocketTradingBot:
                 api_key=self.api_key,
                 api_secret=self.api_secret,
             )
-            # Fixed parameter signature rules (Positional depth level mapping)
+            # Fixed parameter signature rules
             self.ws.orderbook_stream(
                 50,
                 symbol=SYMBOL,
@@ -437,9 +606,9 @@ class WebSocketTradingBot:
 
     async def run(self):
         """Main bot loop managed via Asyncio"""
-        logger.info(f"🚀 Starting WebSocket bot on {SYMBOL}")
+        logger.info(f"🚀 Starting Paper Trading Bot on {SYMBOL}")
         logger.info(f"   Leverage: {LEVERAGE}x")
-        logger.info(f"   Trading hours: 8:00 - 17:00 UTC")
+        logger.info(f"   Initial Balance: ${PAPER_INITIAL_BALANCE:.2f}")
         
         self.running = True
         
@@ -448,23 +617,46 @@ class WebSocketTradingBot:
         self.websocket_thread.start()
         
         # Keep main runtime alive and safely monitor state
+        stats_counter = 0
         while self.running:
             await asyncio.sleep(1)
             current_time = int(time.time())
-            if current_time % 60 == 0:  # Monitor balance once a minute
-                #Double check state flag before making duplicate REST queries
+            
+            # Monitor balance and save stats every minute
+            if current_time % 60 == 0:
                 if not self.running:
                     break
-                    
-                balance = await self.async_get_balance()
-                logger.info(f"💰 Account Equity Balance: ${balance:.2f}")
-
+                
+                balance = await self.async_get_paper_balance()
+                equity = self.paper_state.get_equity()
+                
+                # Get trading stats
+                stats = self.paper_state.get_stats()
+                
+                logger.info(f"💰 [PAPER] Balance: ${balance:.2f} | Equity: ${equity:.2f} | P&L: ${stats['total_pnl']:.2f} | Trades: {stats['total_trades']} | Win Rate: {stats['win_rate']:.1f}%")
+                
+                # Save stats to CSV
+                self.save_paper_stats()
+                
+                # Check if we should stop
                 if balance < MIN_BALANCE:
-                    logger.critical(f"💀 Supervisor detected low balance (${balance:.2f}). Stopping system runtime.")
+                    logger.critical(f"💀 Paper balance too low (${balance:.2f}). Stopping system runtime.")
                     self.running = False
                     if self.ws:
                         self.ws.exit()
                     break
+
+        # Print final stats
+        final_stats = self.paper_state.get_stats()
+        logger.info("=" * 60)
+        logger.info("📊 PAPER TRADING FINAL STATISTICS")
+        logger.info("=" * 60)
+        logger.info(f"Total Trades: {final_stats['total_trades']}")
+        logger.info(f"Win Rate: {final_stats['win_rate']:.2f}%")
+        logger.info(f"Total P&L: ${final_stats['total_pnl']:.2f}")
+        logger.info(f"Final Balance: ${final_stats['balance']:.2f}")
+        logger.info(f"Final Equity: ${final_stats['equity']:.2f}")
+        logger.info("=" * 60)
 
 
 # ============================================
@@ -472,14 +664,14 @@ class WebSocketTradingBot:
 # ============================================
 
 async def main():
-    # Pass the active loop reference down into the constructor block
-    bot = WebSocketTradingBot(loop=asyncio.get_running_loop())
+    # Pass the active loop reference down to the constructor block
+    bot = PaperTradingBot(loop=asyncio.get_running_loop())
     await bot.run()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Bot stopped by user manually.")
+        logger.info("🛑 Paper trading bot stopped by user manually.")
     except Exception as e:
         logger.error(f"❌ Fatal error in loop initialization payload: {e}")
