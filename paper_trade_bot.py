@@ -103,6 +103,12 @@ class PaperTradingState:
         
         # Apply leverage to P&L
         pnl = pnl * LEVERAGE
+
+        # Deduct Bybit taker fees (Entry + Exit)
+        FEE_RATE = 0.00055  # Bybit taker fee
+        position_value = abs(self.position) * self.entry_price
+        fees = position_value * FEE_RATE * 2 * LEVERAGE  # Entry + Exit
+        pnl = pnl - fees
         
         # Update balance
         self.balance += pnl
@@ -384,6 +390,12 @@ class PaperTradingBot:
             if self.paper_state.position != 0:
                 logger.warning("⚠️ Position already open, closing first")
                 self.paper_state.close_position(self.current_price)
+
+            # Check if price has moved enough
+            min_price_change = 0.000005  # 5 micro-pips
+            if abs(self.current_price - self.entry_price) < min_price_change:
+                logger.warning(f"Price not moving enough, skipping trade")
+                return False
             
             # Open paper position
             entry_price = self.current_price
