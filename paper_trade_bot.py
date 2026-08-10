@@ -475,11 +475,11 @@ class PaperTradingBot:
             side = None
             entry_price = self.current_price
             
-            if rsi > 65 and price_vs_sma > 0.002:
+            if rsi > 58 and price_vs_sma > 0.0005:
                 side = "Sell"
                 tp_price = round(entry_price * (1 - TARGET_PERCENT), 8)
                 sl_price = round(entry_price * (1 + STOP_PERCENT), 8)
-            elif rsi < 35 and price_vs_sma < -0.002:
+            elif rsi < 35 and price_vs_sma < -0.0005:
                 side = "Buy"
                 tp_price = round(entry_price * (1 + TARGET_PERCENT), 8)
                 sl_price = round(entry_price * (1 - STOP_PERCENT), 8)
