@@ -231,14 +231,18 @@ class PaperTradingState:
                 self.close_position(exit_price)
             elif exit_price <= sl_price:
                 logger.info(f"🛑 [PAPER] Stop Loss hit! Closing long position")
-                self.close_position(exit_price)
+                worst_case_exit = sl_price - (self.tick_size * 3)
+                actual_exit = max(exit_price, worst_case_exit)
+                self.close_position(actual_exit)
         else:  # Short
             if exit_price <= tp_price:
                 logger.info(f"🎯 [PAPER] Take Profit hit! Closing short position")
                 self.close_position(exit_price)
             elif exit_price >= sl_price:
                 logger.info(f"🛑 [PAPER] Stop Loss hit! Closing short position")
-                self.close_position(exit_price)
+                worst_case_exit = sl_price + (self.tick_size * 3)
+                actual_exit = min(exit_price, worst_case_exit)
+                self.close_position(actual_exit)
     
     def get_equity(self):
         if self.position == 0: return self.balance
@@ -291,10 +295,11 @@ class PaperTradingBot:
         try:
             info = self.session.get_instruments_info(category="linear", symbol=SYMBOL)
             self.qty_step = info['result']['list'][0]['lotSizeFilter']['qtyStep']
-            logger.info(f"✅ Fetched dynamic lot step for {SYMBOL}: {self.qty_step}")
+            self.tick_size = float(info['result']['list'][0]['priceFilter']['tickSize']) # NEW
+            logger.info(f"✅ Fetched Tick Size: {self.tick_size}")
         except Exception as e:
             logger.error(f"Failed to fetch lot step, defaulting to 1: {e}")
-            self.qty_step = '1'
+            self.tick_size = 0.000001 # Fallback
             
         self.ws = None  
         self.current_price = 0.0
@@ -456,6 +461,13 @@ class PaperTradingBot:
             atr = self.calculate_atr(14)
             closes = self.candle_agg.get_closes()
             sma = np.mean(closes[-20:]) if len(closes) >= 20 else self.current_price
+
+            fee_drag_percent = 0.00055 * 2  # 0.11% round trip
+            volatility_percent = (atr / self.current_price) if self.current_price > 0 else 0
+            if volatility_percent < fee_drag_percent:
+                # Market is too quiet; fees will eat all profits
+                self.is_trading = False
+                return
             
             # Orderbook Imbalance (Top 5 levels)
             total_vol = self.top_bid_vol + self.top_ask_vol
@@ -467,13 +479,27 @@ class PaperTradingBot:
             if rsi < RSI_BUY_THRESHOLD and self.current_price > sma and imbalance > 0.55:
                 side = "Buy"
                 entry_price = self.best_ask
-                tp_price = round(entry_price + (atr * TP_ATR_MULT), 8)
-                sl_price = round(entry_price - (atr * SL_ATR_MULT), 8)
+                # Enforce minimum distance (e.g., at least 5 ticks)
+                min_dist = self.tick_size * 5
+                tp_dist = max(atr * TP_ATR_MULT, min_dist)
+                sl_dist = max(atr * SL_ATR_MULT, min_dist)
+                # Calculate and Round to nearest valid tick
+                tp_price = round(entry_price + tp_dist, 8)
+                tp_price = round(tp_price / self.tick_size) * self.tick_size
+                sl_price = round(entry_price - sl_dist, 8)
+                sl_price = round(sl_price / self.tick_size) * self.tick_size
             elif rsi > RSI_SELL_THRESHOLD and self.current_price < sma and imbalance < 0.45:
                 side = "Sell"
                 entry_price = self.best_bid
-                tp_price = round(entry_price - (atr * TP_ATR_MULT), 8)
-                sl_price = round(entry_price + (atr * SL_ATR_MULT), 8)
+                # Enforce minimum distance (e.g., at least 5 ticks)
+                min_dist = self.tick_size * 5
+                tp_dist = max(atr * TP_ATR_MULT, min_dist)
+                sl_dist = max(atr * SL_ATR_MULT, min_dist)
+                # Calculate and Round to nearest valid tick
+                tp_price = round(entry_price - tp_dist, 8)
+                tp_price = round(tp_price / self.tick_size) * self.tick_size
+                sl_price = round(entry_price + sl_dist, 8)
+                sl_price = round(sl_price / self.tick_size) * self.tick_size
             else:
                 self.is_trading = False
                 return
