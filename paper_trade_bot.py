@@ -216,8 +216,10 @@ class SymbolTracker:
     def calculate_tp_sl(self, side, entry_price):
         """Calculate tick-aligned TP/SL with minimum distance enforcement."""
         min_dist = self.tick_size * MIN_TICK_DISTANCE
+        spread_dist = self.best_ask - self.best_bid  # Current spread
+        # SL must be at least spread + buffer away
+        sl_dist = max(self.last_atr * SL_ATR_MULT, min_dist, spread_dist * 1.5)
         tp_dist = max(self.last_atr * TP_ATR_MULT, min_dist)
-        sl_dist = max(self.last_atr * SL_ATR_MULT, min_dist)
 
         if side == "Buy":
             tp_raw = entry_price + tp_dist
@@ -297,7 +299,10 @@ class MultiPositionState:
         else:
             pnl = (entry_price - exit_price) * quantity
 
-        pnl *= LEVERAGE
+
+        # If losing trade, apply a symbol-specific cooldown
+        if pnl < 0:
+            self.symbol_cooldowns[symbol] = time.time() + 60  # 60s cooldown
 
         # Fees
         position_value = quantity * entry_price
@@ -432,6 +437,7 @@ class MultiSymbolBot:
         self.state = MultiPositionState()
         self.state.load_state()
 
+        self.symbol_cooldowns = {}  # symbol -> cooldown timestamp
         self.ws = None
         self.running = False
         self.is_trading = False
@@ -503,6 +509,10 @@ class MultiSymbolBot:
 
             # Scan all symbols for signals
             for symbol, tracker in self.trackers.items():
+                # Skip if symbol is in cooldown
+                if symbol in self.symbol_cooldowns and now < self.symbol_cooldowns[symbol]:
+                    continue
+
                 # Skip if already have position in this symbol
                 if symbol in self.state.positions:
                     continue
@@ -519,12 +529,22 @@ class MultiSymbolBot:
                 if signal is None:
                     continue
 
-                # Log signal
-                self._log_signal(symbol, tracker, signal)
-
                 # Execute trade
                 entry_price = tracker.best_ask if signal == "Buy" else tracker.best_bid
                 tp_price, sl_price = tracker.calculate_tp_sl(signal, entry_price)
+
+                # Validate SL against market spread
+                if signal == "Sell":
+                    # For shorts, SL must be ABOVE best_ask (not just above entry)
+                    if sl_price <= tracker.best_ask:
+                        continue  # Skip, SL is inside spread
+                elif signal == "Buy":
+                    # For longs, SL must be BELOW best_bid
+                    if sl_price >= tracker.best_bid:
+                        continue
+
+                # Log signal
+                self._log_signal(symbol, tracker, signal)
 
                 notional = MAX_TRADE_SIZE * LEVERAGE
                 quantity = notional / entry_price
