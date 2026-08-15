@@ -169,6 +169,8 @@ class SymbolTracker:
         avg_g  = float(np.mean(gains[-period:]))
         avg_l  = float(np.mean(losses[-period:]))
         if avg_l == 0:
+            if avg_g == 0:
+                return 50.0  # No movement at all, neutral RSI
             return 100.0
         return 100.0 - 100.0 / (1.0 + avg_g / avg_l)
 
@@ -189,6 +191,9 @@ class SymbolTracker:
     def get_signal(self) -> str | None:
         if len(self.candle_agg.candles) < SMA_PERIOD:
             return None
+        min_atr_threshold = self.tick_size * 10 
+        if self.last_atr < min_atr_threshold:
+            return None
         # Fee-drag filter: skip if volatility < round-trip fee cost
         if self.current_price > 0 and self.last_atr > 0:
             if (self.last_atr / self.current_price) < (0.00055 * 2):
@@ -200,11 +205,18 @@ class SymbolTracker:
         return None
 
     # ── TP / SL ──────────────────────────────────────────────
-    def calculate_tp_sl(self, side: str, entry_price: float) -> tuple[float, float]:
+     def calculate_tp_sl(self, side: str, entry_price: float) -> tuple[float, float]:
         min_dist    = self.tick_size * MIN_TICK_DIST
         spread_dist = self.best_ask - self.best_bid
-        sl_dist     = max(self.last_atr * SL_ATR_MULT, min_dist, spread_dist * 1.5)
-        tp_dist     = max(self.last_atr * TP_ATR_MULT, min_dist)
+        
+        # 1. Calculate base distances
+        base_sl_dist = max(self.last_atr * SL_ATR_MULT, min_dist, spread_dist * 1.5)
+        base_tp_dist = max(self.last_atr * TP_ATR_MULT, min_dist)
+        
+        # 2. Enforce positive Risk/Reward (TP must be at least 1.5x the SL distance)
+        # This prevents the inverted R:R bug seen when spread forces a wide SL
+        tp_dist = max(base_tp_dist, base_sl_dist * 1.5)
+        sl_dist = base_sl_dist
 
         if side == "Buy":
             tp_raw = entry_price + tp_dist
@@ -213,8 +225,16 @@ class SymbolTracker:
             tp_raw = entry_price - tp_dist
             sl_raw = entry_price + sl_dist
 
-        tp = round(round(tp_raw, 10) / self.tick_size) * self.tick_size
-        sl = round(round(sl_raw, 10) / self.tick_size) * self.tick_size
+        # 3. Exact tick alignment using Decimal to prevent floating-point drift
+        # (e.g., prevents 0.0026509999999999997 and ensures exact 0.002651)
+        tick_dec = Decimal(str(self.tick_size))
+        
+        tp_dec = (Decimal(str(tp_raw)) / tick_dec).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * tick_dec
+        sl_dec = (Decimal(str(sl_raw)) / tick_dec).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * tick_dec
+
+        tp = float(tp_dec)
+        sl = float(sl_dec)
+        
         return tp, sl
 
     def sl_is_valid(self, side: str, sl_price: float) -> bool:
