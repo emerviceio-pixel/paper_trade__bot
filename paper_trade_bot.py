@@ -17,209 +17,194 @@ from pybit.unified_trading import HTTP, WebSocket
 import numpy as np
 from loguru import logger
 
+# ── Logging ──────────────────────────────────────────────────
 logger.remove()
 logger.add(
     "logs/paper_trading.log",
     rotation="1 day", retention="30 days",
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-    level="INFO"
+    level="INFO",
 )
 logger.add(
     sys.stdout,
     format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <level>{message}</level>",
-    level="DEBUG"
+    level="DEBUG",
 )
 
-load_dotenv(Path(__file__).parent / '.env')
+load_dotenv(Path(__file__).parent / ".env")
 
-# --- CONFIGURATION ---
-SYMBOLS = os.getenv('SYMBOLS', '1000PEPEUSDT,BTCUSDT,ETHUSDT').split(',')
-SYMBOLS = [s.strip() for s in SYMBOLS]
-
-LEVERAGE = int(os.getenv('LEVERAGE', 5))
-MAX_TRADE_SIZE = float(os.getenv('MAX_TRADE_SIZE', 10.0))
-MIN_BALANCE = float(os.getenv('MIN_BALANCE', 9.50))
-LOSS_STREAK_LIMIT = int(os.getenv('LOSS_STREAK_LIMIT', 3))
-MAX_SPREAD = float(os.getenv('MAX_SPREAD', 0.0015))
-MAX_CONCURRENT_POSITIONS = int(os.getenv('MAX_CONCURRENT_POSITIONS', 3))
+# ── Configuration ────────────────────────────────────────────
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", "1000PEPEUSDT,BTCUSDT,ETHUSDT").split(",")]
+LEVERAGE           = int(os.getenv("LEVERAGE", 5))
+MAX_TRADE_SIZE     = float(os.getenv("MAX_TRADE_SIZE", 10.0))
+MIN_BALANCE        = float(os.getenv("MIN_BALANCE", 5.0))
+LOSS_STREAK_LIMIT  = int(os.getenv("LOSS_STREAK_LIMIT", 3))
+MAX_SPREAD         = float(os.getenv("MAX_SPREAD", 0.0015))
+MAX_CONCURRENT     = int(os.getenv("MAX_CONCURRENT_POSITIONS", 3))
+PAPER_INITIAL_BAL  = float(os.getenv("PAPER_INITIAL_BALANCE", 100.0))
 
 # Strategy
-RSI_BUY_THRESHOLD = 35
-RSI_SELL_THRESHOLD = 65
-SMA_PERIOD = 20
-ATR_PERIOD = 14
-SL_ATR_MULT = 1.5
-TP_ATR_MULT = 2.0
-MIN_TICK_DISTANCE = 5  # Minimum ticks for TP/SL
+RSI_BUY_THRESH  = 35
+RSI_SELL_THRESH = 65
+SMA_PERIOD      = 20
+ATR_PERIOD      = 14
+SL_ATR_MULT     = 1.5
+TP_ATR_MULT     = 2.0
+MIN_TICK_DIST   = 5          # minimum ticks for TP / SL
+MAX_SLIP_TICKS  = 3          # max slippage ticks on SL fill
+SYMBOL_COOLDOWN = 60         # seconds before re-entering after a loss
 
-# Paper Trading
-PAPER_INITIAL_BALANCE = float(os.getenv('PAPER_INITIAL_BALANCE', 100.0))
-PAPER_TRADE_LOG = Path(__file__).parent / 'data' / 'paper_trades.jsonl'
-PAPER_PNL_LOG = Path(__file__).parent / 'data' / 'paper_pnl.csv'
-SIGNAL_LOG = Path(__file__).parent / 'data' / 'signals.csv'
+# Paths
+DATA_DIR       = Path(__file__).parent / "data"
+TRADE_LOG      = DATA_DIR / "paper_trades.jsonl"
+PNL_LOG        = DATA_DIR / "paper_pnl.csv"
+SIGNAL_LOG     = DATA_DIR / "signals.csv"
 
 
-# ============================================================
-# CANDLE AGGREGATOR (unchanged)
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  CANDLE AGGREGATOR
+# ════════════════════════════════════════════════════════════
 class CandleAggregator:
-    def __init__(self, interval_sec=60):
+    """Builds OHLCV candles from raw ticks."""
+
+    def __init__(self, interval_sec: int = 60):
         self.interval_sec = interval_sec
-        self.candles = deque(maxlen=200)
-        self.current_candle = None
+        self.candles: deque = deque(maxlen=200)
+        self.current_candle: dict | None = None
 
-    def update(self, price, volume=0, timestamp=None):
-        if timestamp is None:
-            timestamp = time.time()
-        candle_time = int(timestamp // self.interval_sec) * self.interval_sec
+    def update(self, price: float, volume: float = 0.0, ts: float | None = None):
+        if ts is None:
+            ts = time.time()
+        candle_time = int(ts // self.interval_sec) * self.interval_sec
 
-        if self.current_candle is None or self.current_candle['time'] != candle_time:
+        if self.current_candle is None or self.current_candle["time"] != candle_time:
             if self.current_candle is not None:
                 self.candles.append(self.current_candle)
             self.current_candle = {
-                'time': candle_time, 'open': price, 'high': price,
-                'low': price, 'close': price, 'volume': volume
+                "time": candle_time, "open": price, "high": price,
+                "low": price, "close": price, "volume": volume,
             }
         else:
-            self.current_candle['high'] = max(self.current_candle['high'], price)
-            self.current_candle['low'] = min(self.current_candle['low'], price)
-            self.current_candle['close'] = price
-            self.current_candle['volume'] += volume
+            c = self.current_candle
+            c["high"] = max(c["high"], price)
+            c["low"]  = min(c["low"], price)
+            c["close"] = price
+            c["volume"] += volume
 
-    def get_closes(self):
-        closes = [c['close'] for c in self.candles]
+    def _series(self, key: str) -> np.ndarray:
+        vals = [c[key] for c in self.candles]
         if self.current_candle:
-            closes.append(self.current_candle['close'])
-        return np.array(closes)
+            vals.append(self.current_candle[key])
+        return np.array(vals, dtype=float)
 
-    def get_highs(self):
-        highs = [c['high'] for c in self.candles]
-        if self.current_candle:
-            highs.append(self.current_candle['high'])
-        return np.array(highs)
-
-    def get_lows(self):
-        lows = [c['low'] for c in self.candles]
-        if self.current_candle:
-            lows.append(self.current_candle['low'])
-        return np.array(lows)
+    def get_closes(self): return self._series("close")
+    def get_highs(self):  return self._series("high")
+    def get_lows(self):   return self._series("low")
 
 
-# ============================================================
-# PER-SYMBOL TRACKER (NEW)
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  PER-SYMBOL TRACKER
+# ════════════════════════════════════════════════════════════
 class SymbolTracker:
-    """Isolates all market data, indicators, and signal state per symbol."""
+    """Isolates market data, indicators and signal logic per symbol."""
 
     def __init__(self, symbol: str, tick_size: float, qty_step: str):
-        self.symbol = symbol
+        self.symbol    = symbol
         self.tick_size = tick_size
-        self.qty_step = qty_step
+        self.qty_step  = qty_step
 
-        # Orderbook state
         self.current_price = 0.0
-        self.best_bid = 0.0
-        self.best_ask = 0.0
-        self.top_bid_vol = 0.0
-        self.top_ask_vol = 0.0
-        self.last_update_time = 0
+        self.best_bid      = 0.0
+        self.best_ask      = 0.0
+        self.top_bid_vol   = 0.0
+        self.top_ask_vol   = 0.0
+        self.last_update   = 0.0
 
-        # Indicators
         self.candle_agg = CandleAggregator(interval_sec=60)
 
-        # Signal state (for logging even when not trading)
-        self.last_rsi = 50.0
-        self.last_atr = 0.0
-        self.last_sma = 0.0
+        # Cached indicator values (updated periodically)
+        self.last_rsi       = 50.0
+        self.last_atr       = 0.0
+        self.last_sma       = 0.0
         self.last_imbalance = 0.5
-        self.last_signal = None
-        self.last_signal_time = 0
 
-    def update_orderbook(self, bids, asks):
+    # ── orderbook ────────────────────────────────────────────
+    def update_orderbook(self, bids: list, asks: list):
         if bids:
-            self.best_bid = float(bids[0][0])
+            self.best_bid    = float(bids[0][0])
             self.top_bid_vol = sum(float(b[1]) for b in bids[:5])
         if asks:
-            self.best_ask = float(asks[0][0])
+            self.best_ask    = float(asks[0][0])
             self.top_ask_vol = sum(float(a[1]) for a in asks[:5])
 
         if self.best_bid > 0 and self.best_ask > 0:
-            self.current_price = (self.best_bid + self.best_ask) / 2
-            self.last_update_time = time.time()
-            self.candle_agg.update(self.current_price, timestamp=self.last_update_time)
+            self.current_price = (self.best_bid + self.best_ask) / 2.0
+            self.last_update   = time.time()
+            self.candle_agg.update(self.current_price, ts=self.last_update)
 
     @property
-    def spread(self):
-        if self.best_bid <= 0:
-            return float('inf')
-        return (self.best_ask - self.best_bid) / self.best_bid
+    def spread(self) -> float:
+        return (self.best_ask - self.best_bid) / self.best_bid if self.best_bid > 0 else float("inf")
 
     @property
-    def imbalance(self):
+    def imbalance(self) -> float:
         total = self.top_bid_vol + self.top_ask_vol
         return self.top_bid_vol / total if total > 0 else 0.5
 
-    def calculate_rsi(self, period=14):
+    # ── indicators ───────────────────────────────────────────
+    def refresh_indicators(self):
+        self.last_rsi       = self._rsi(ATR_PERIOD)
+        self.last_atr       = self._atr(ATR_PERIOD)
+        closes              = self.candle_agg.get_closes()
+        self.last_sma       = float(np.mean(closes[-SMA_PERIOD:])) if len(closes) >= SMA_PERIOD else self.current_price
+        self.last_imbalance = self.imbalance
+
+    def _rsi(self, period: int = 14) -> float:
         closes = self.candle_agg.get_closes()
         if len(closes) < period + 1:
             return 50.0
         deltas = np.diff(closes)
-        gains = np.where(deltas > 0, deltas, 0)
-        losses = np.where(deltas < 0, -deltas, 0)
-        avg_gain = np.mean(gains[-period:])
-        avg_loss = np.mean(losses[-period:])
-        if avg_loss == 0:
+        gains  = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+        avg_g  = float(np.mean(gains[-period:]))
+        avg_l  = float(np.mean(losses[-period:]))
+        if avg_l == 0:
             return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
+        return 100.0 - 100.0 / (1.0 + avg_g / avg_l)
 
-    def calculate_atr(self, period=14):
+    def _atr(self, period: int = 14) -> float:
         closes = self.candle_agg.get_closes()
-        highs = self.candle_agg.get_highs()
-        lows = self.candle_agg.get_lows()
+        highs  = self.candle_agg.get_highs()
+        lows   = self.candle_agg.get_lows()
         if len(closes) < period + 1:
             return 0.0
-        prev_closes = closes[:-1]
-        curr_highs = highs[1:]
-        curr_lows = lows[1:]
-        tr1 = curr_highs - curr_lows
-        tr2 = np.abs(curr_highs - prev_closes)
-        tr3 = np.abs(curr_lows - prev_closes)
-        tr = np.maximum(tr1, np.maximum(tr2, tr3))
-        return np.mean(tr[-period:])
+        prev_c = closes[:-1]
+        tr = np.maximum(
+            highs[1:] - lows[1:],
+            np.maximum(np.abs(highs[1:] - prev_c), np.abs(lows[1:] - prev_c)),
+        )
+        return float(np.mean(tr[-period:]))
 
-    def update_indicators(self):
-        """Recalculate all indicators. Call periodically, not every tick."""
-        self.last_rsi = self.calculate_rsi(RSI_PERIOD if 'RSI_PERIOD' in dir() else 14)
-        self.last_atr = self.calculate_atr(ATR_PERIOD)
-        closes = self.candle_agg.get_closes()
-        self.last_sma = np.mean(closes[-SMA_PERIOD:]) if len(closes) >= SMA_PERIOD else self.current_price
-        self.last_imbalance = self.imbalance
-
-    def get_signal(self):
-        """Evaluate trading signal. Returns 'Buy', 'Sell', or None."""
+    # ── signal ───────────────────────────────────────────────
+    def get_signal(self) -> str | None:
         if len(self.candle_agg.candles) < SMA_PERIOD:
             return None
-
-        # Fee drag filter
+        # Fee-drag filter: skip if volatility < round-trip fee cost
         if self.current_price > 0 and self.last_atr > 0:
-            vol_pct = self.last_atr / self.current_price
-            if vol_pct < (0.00055 * 2):  # Below round-trip fee cost
+            if (self.last_atr / self.current_price) < (0.00055 * 2):
                 return None
-
-        if self.last_rsi < RSI_BUY_THRESHOLD and self.current_price > self.last_sma and self.last_imbalance > 0.55:
+        if self.last_rsi < RSI_BUY_THRESH and self.current_price > self.last_sma and self.last_imbalance > 0.55:
             return "Buy"
-        elif self.last_rsi > RSI_SELL_THRESHOLD and self.current_price < self.last_sma and self.last_imbalance < 0.45:
+        if self.last_rsi > RSI_SELL_THRESH and self.current_price < self.last_sma and self.last_imbalance < 0.45:
             return "Sell"
         return None
 
-    def calculate_tp_sl(self, side, entry_price):
-        """Calculate tick-aligned TP/SL with minimum distance enforcement."""
-        min_dist = self.tick_size * MIN_TICK_DISTANCE
-        spread_dist = self.best_ask - self.best_bid  # Current spread
-        # SL must be at least spread + buffer away
-        sl_dist = max(self.last_atr * SL_ATR_MULT, min_dist, spread_dist * 1.5)
-        tp_dist = max(self.last_atr * TP_ATR_MULT, min_dist)
+    # ── TP / SL ──────────────────────────────────────────────
+    def calculate_tp_sl(self, side: str, entry_price: float) -> tuple[float, float]:
+        min_dist    = self.tick_size * MIN_TICK_DIST
+        spread_dist = self.best_ask - self.best_bid
+        sl_dist     = max(self.last_atr * SL_ATR_MULT, min_dist, spread_dist * 1.5)
+        tp_dist     = max(self.last_atr * TP_ATR_MULT, min_dist)
 
         if side == "Buy":
             tp_raw = entry_price + tp_dist
@@ -228,98 +213,109 @@ class SymbolTracker:
             tp_raw = entry_price - tp_dist
             sl_raw = entry_price + sl_dist
 
-        # Round to valid tick size
-        tp_price = round(round(tp_raw, 10) / self.tick_size) * self.tick_size
-        sl_price = round(round(sl_raw, 10) / self.tick_size) * self.tick_size
-        return tp_price, sl_price
+        tp = round(round(tp_raw, 10) / self.tick_size) * self.tick_size
+        sl = round(round(sl_raw, 10) / self.tick_size) * self.tick_size
+        return tp, sl
+
+    def sl_is_valid(self, side: str, sl_price: float) -> bool:
+        """Reject SL that sits inside the current spread."""
+        if side == "Sell" and sl_price <= self.best_ask:
+            return False
+        if side == "Buy" and sl_price >= self.best_bid:
+            return False
+        return True
 
 
-# ============================================================
-# MULTI-POSITION PAPER STATE (NEW)
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  MULTI-POSITION PAPER STATE
+# ════════════════════════════════════════════════════════════
 class MultiPositionState:
-    """Manages multiple concurrent positions with a shared balance."""
+    """Shared balance, multiple concurrent positions, trade history."""
 
-    def __init__(self, initial_balance=PAPER_INITIAL_BALANCE):
+    FEE_RATE = 0.00055
+
+    def __init__(self, initial_balance: float = PAPER_INITIAL_BAL):
         self.initial_balance = initial_balance
-        self.balance = initial_balance
-        self.positions = {}  # symbol -> position dict
-        self.trades = []
-        self.total_pnl = 0.0
-        self.win_count = 0
-        self.loss_count = 0
+        self.balance         = initial_balance
+        self.positions: dict[str, dict] = {}
+        self.trades: list[dict]         = []
+        self.total_pnl    = 0.0
+        self.win_count    = 0
+        self.loss_count   = 0
         self.gross_profit = 0.0
-        self.gross_loss = 0.0
-        self.peak_equity = initial_balance
+        self.gross_loss   = 0.0
+        self.peak_equity  = initial_balance
         self.max_drawdown = 0.0
 
+    # ── persistence ──────────────────────────────────────────
     def load_state(self):
-        if PAPER_TRADE_LOG.exists():
-            with open(PAPER_TRADE_LOG, 'r') as f:
-                for line in f:
-                    try:
-                        trade = json.loads(line)
-                        self.trades.append(trade)
-                        self.balance = trade.get('balance_after', self.balance)
-                        pnl = trade.get('pnl', 0)
-                        self.total_pnl += pnl
-                        if pnl > 0:
-                            self.win_count += 1
-                            self.gross_profit += pnl
-                        else:
-                            self.loss_count += 1
-                            self.gross_loss += abs(pnl)
-                    except Exception:
-                        pass
-            self.peak_equity = max(self.peak_equity, self.balance)
-            logger.info(f"📂 Loaded {len(self.trades)} trades. Balance: ${self.balance:.2f}")
+        if not TRADE_LOG.exists():
+            return
+        with open(TRADE_LOG, "r") as fh:
+            for line in fh:
+                try:
+                    t = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                self.trades.append(t)
+                self.balance = t.get("balance_after", self.balance)
+                pnl = t.get("pnl", 0.0)
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1; self.gross_profit += pnl
+                else:
+                    self.loss_count += 1; self.gross_loss += abs(pnl)
+        self.peak_equity = max(self.peak_equity, self.balance)
+        logger.info(f"📂 Loaded {len(self.trades)} trades. Balance: ${self.balance:.2f}")
 
-    def open_position(self, symbol, side, quantity, entry_price, tp_price, sl_price):
+    def _save_trade(self, rec: dict):
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        with open(TRADE_LOG, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    # ── position lifecycle ───────────────────────────────────
+    def open_position(self, symbol: str, side: str, qty: float,
+                      entry: float, tp: float, sl: float, tick_size: float):
         if symbol in self.positions:
-            logger.warning(f"⚠️ [{symbol}] Position already open, closing first")
-            self.close_position(symbol, entry_price)
+            logger.warning(f"⚠️ [{symbol}] Position already open – closing first")
+            self.close_position(symbol, entry, tick_size)
 
         self.positions[symbol] = {
-            'side': side, 'quantity': quantity, 'entry_price': entry_price,
-            'tp_price': tp_price, 'sl_price': sl_price,
-            'open_time': datetime.now(timezone.utc).isoformat(), 'status': 'open'
+            "side": side, "quantity": qty, "entry_price": entry,
+            "tp_price": tp, "sl_price": sl, "tick_size": tick_size,
+            "current_price": entry,
+            "open_time": datetime.now(timezone.utc).isoformat(),
+            "status": "open",
         }
-        logger.info(f"📊 [{symbol}] Opened {side}: {quantity:.4f} @ {entry_price:.8f} | TP: {tp_price:.8f} | SL: {sl_price:.8f}")
+        logger.info(
+            f"📊 [{symbol}] Opened {side}: {qty:.4f} @ {entry:.8f} "
+            f"| TP: {tp:.8f} | SL: {sl:.8f}"
+        )
 
-    def close_position(self, symbol, exit_price):
-        if symbol not in self.positions:
+    def close_position(self, symbol: str, exit_price: float, tick_size: float) -> float:
+        pos = self.positions.pop(symbol, None)
+        if pos is None:
             return 0.0
 
-        pos = self.positions[symbol]
-        quantity = pos['quantity']
-        entry_price = pos['entry_price']
+        qty   = pos["quantity"]
+        entry = pos["entry_price"]
+        side  = pos["side"]
 
-        if pos['side'] == "Buy":
-            pnl = (exit_price - entry_price) * quantity
-        else:
-            pnl = (entry_price - exit_price) * quantity
+        raw_pnl = (exit_price - entry) * qty if side == "Buy" else (entry - exit_price) * qty
+        pnl     = raw_pnl * LEVERAGE
 
+        notional = qty * entry
+        fees     = notional * self.FEE_RATE * 2 * LEVERAGE
+        pnl     -= fees
 
-        # If losing trade, apply a symbol-specific cooldown
-        if pnl < 0:
-            self.symbol_cooldowns[symbol] = time.time() + 60  # 60s cooldown
-
-        # Fees
-        position_value = quantity * entry_price
-        fees = position_value * 0.00055 * 2 * LEVERAGE
-        pnl -= fees
-
-        self.balance += pnl
+        self.balance   += pnl
         self.total_pnl += pnl
 
         if pnl > 0:
-            self.win_count += 1
-            self.gross_profit += pnl
+            self.win_count += 1; self.gross_profit += pnl
         else:
-            self.loss_count += 1
-            self.gross_loss += abs(pnl)
+            self.loss_count += 1; self.gross_loss += abs(pnl)
 
-        # Drawdown
         equity = self.get_equity()
         if equity > self.peak_equity:
             self.peak_equity = equity
@@ -327,153 +323,190 @@ class MultiPositionState:
         if dd > self.max_drawdown:
             self.max_drawdown = dd
 
-        margin_used = (entry_price * quantity) / LEVERAGE
-        pnl_percent = (pnl / margin_used) * 100 if margin_used > 0 else 0
+        margin     = notional / LEVERAGE
+        pnl_pct    = (pnl / margin) * 100 if margin > 0 else 0.0
 
-        trade_record = {
-            **pos, 'symbol': symbol,
-            'exit_price': exit_price,
-            'exit_time': datetime.now(timezone.utc).isoformat(),
-            'pnl': pnl, 'pnl_percent': pnl_percent,
-            'balance_after': self.balance, 'status': 'closed'
+        rec = {
+            **pos, "symbol": symbol,
+            "exit_price": exit_price,
+            "exit_time": datetime.now(timezone.utc).isoformat(),
+            "pnl": pnl, "pnl_percent": pnl_pct,
+            "balance_after": self.balance, "status": "closed",
         }
-        self.trades.append(trade_record)
-        del self.positions[symbol]
+        self.trades.append(rec)
+        self._save_trade(rec)
 
-        logger.info(f"📊 [{symbol}] Closed @ {exit_price:.8f} | P&L: ${pnl:.4f} | Balance: ${self.balance:.2f}")
-        self._save_trade(trade_record)
+        logger.info(
+            f"📊 [{symbol}] Closed {side} @ {exit_price:.8f} "
+            f"| P&L: ${pnl:.4f} | Bal: ${self.balance:.2f}"
+        )
         return pnl
 
-    def check_tp_sl(self, symbol, best_bid, best_ask):
-        """Check if TP/SL is hit for a given symbol."""
-        if symbol not in self.positions:
-            return
+    # ── TP / SL check (called from WS thread) ───────────────
+    def check_tp_sl(self, symbol: str, best_bid: float, best_ask: float) -> float | None:
+        """Returns pnl if a position was closed, else None."""
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return None
 
-        pos = self.positions[symbol]
-        exit_price = best_bid if pos['side'] == "Buy" else best_ask
+        tick  = pos.get("tick_size", 0.000001)
+        side  = pos["side"]
+        tp    = pos["tp_price"]
+        sl    = pos["sl_price"]
 
-        if pos['side'] == "Buy":
-            if exit_price >= pos['tp_price']:
-                logger.info(f"🎯 [{symbol}] TP hit!")
-                self.close_position(symbol, exit_price)
-            elif exit_price <= pos['sl_price']:
-                logger.info(f"🛑 [{symbol}] SL hit!")
-                self.close_position(symbol, exit_price)
+        # Realistic taker exit price
+        exit_price = best_bid if side == "Buy" else best_ask
+
+        hit = False
+        if side == "Buy":
+            if exit_price >= tp:
+                hit = True
+            elif exit_price <= sl:
+                hit = True
+                # Cap slippage
+                worst = sl - tick * MAX_SLIP_TICKS
+                exit_price = max(exit_price, worst)
         else:
-            if exit_price <= pos['tp_price']:
-                logger.info(f"🎯 [{symbol}] TP hit!")
-                self.close_position(symbol, exit_price)
-            elif exit_price >= pos['sl_price']:
-                logger.info(f"🛑 [{symbol}] SL hit!")
-                self.close_position(symbol, exit_price)
+            if exit_price <= tp:
+                hit = True
+            elif exit_price >= sl:
+                hit = True
+                worst = sl + tick * MAX_SLIP_TICKS
+                exit_price = min(exit_price, worst)
 
-    def get_equity(self):
-        equity = self.balance
-        for symbol, pos in self.positions.items():
-            # Use mid-price approximation for unrealized P&L
-            if pos['side'] == "Buy":
-                unrealized = (pos.get('current_price', pos['entry_price']) - pos['entry_price']) * pos['quantity'] * LEVERAGE
-            else:
-                unrealized = (pos['entry_price'] - pos.get('current_price', pos['entry_price'])) * pos['quantity'] * LEVERAGE
-            equity += unrealized
-        return equity
+        if hit:
+            label = "TP" if (exit_price >= tp if side == "Buy" else exit_price <= tp) else "SL"
+            emoji = "🎯" if label == "TP" else "🛑"
+            logger.info(f"{emoji} [{symbol}] {label} hit!")
+            return self.close_position(symbol, exit_price, tick)
+        return None
 
-    def update_current_price(self, symbol, price):
+    # ── equity / stats ───────────────────────────────────────
+    def update_current_price(self, symbol: str, price: float):
         if symbol in self.positions:
-            self.positions[symbol]['current_price'] = price
+            self.positions[symbol]["current_price"] = price
 
-    def _save_trade(self, record):
-        PAPER_TRADE_LOG.parent.mkdir(exist_ok=True, parents=True)
-        with open(PAPER_TRADE_LOG, 'a') as f:
-            f.write(json.dumps(record) + '\n')
+    def get_equity(self) -> float:
+        eq = self.balance
+        for pos in self.positions.values():
+            cp    = pos.get("current_price", pos["entry_price"])
+            entry = pos["entry_price"]
+            qty   = pos["quantity"]
+            if pos["side"] == "Buy":
+                eq += (cp - entry) * qty * LEVERAGE
+            else:
+                eq += (entry - cp) * qty * LEVERAGE
+        return eq
 
-    def get_stats(self):
-        total = len(self.trades)
-        if total == 0:
-            return {'total_trades': 0, 'win_rate': 0, 'total_pnl': 0,
-                    'balance': self.balance, 'equity': self.get_equity(),
-                    'max_drawdown': 0, 'profit_factor': 0, 'expectancy': 0,
-                    'open_positions': len(self.positions)}
-        pf = self.gross_profit / self.gross_loss if self.gross_loss > 0 else float('inf')
+    def get_stats(self) -> dict:
+        n = len(self.trades)
+        if n == 0:
+            return {
+                "total_trades": 0, "win_rate": 0, "total_pnl": 0,
+                "balance": self.balance, "equity": self.get_equity(),
+                "max_drawdown": 0, "profit_factor": 0, "expectancy": 0,
+                "open_positions": len(self.positions),
+            }
+        pf = self.gross_profit / self.gross_loss if self.gross_loss > 0 else float("inf")
         return {
-            'total_trades': total,
-            'win_rate': (self.win_count / total) * 100,
-            'total_pnl': self.total_pnl,
-            'balance': self.balance,
-            'equity': self.get_equity(),
-            'max_drawdown': self.max_drawdown * 100,
-            'profit_factor': pf,
-            'expectancy': self.total_pnl / total,
-            'open_positions': len(self.positions)
+            "total_trades": n,
+            "win_rate": (self.win_count / n) * 100,
+            "total_pnl": self.total_pnl,
+            "balance": self.balance,
+            "equity": self.get_equity(),
+            "max_drawdown": self.max_drawdown * 100,
+            "profit_factor": pf,
+            "expectancy": self.total_pnl / n,
+            "open_positions": len(self.positions),
         }
 
 
-# ============================================================
-# MULTI-SYMBOL BOT
-# ============================================================
+# ════════════════════════════════════════════════════════════
+#  MULTI-SYMBOL BOT
+# ════════════════════════════════════════════════════════════
 class MultiSymbolBot:
-    def __init__(self, loop=None):
-        self.api_key = os.getenv('BYBIT_API_KEY')
-        self.api_secret = os.getenv('BYBIT_SECRET_KEY')
+    def __init__(self, loop: asyncio.AbstractEventLoop | None = None):
+        self.api_key    = os.getenv("BYBIT_API_KEY", "")
+        self.api_secret = os.getenv("BYBIT_SECRET_KEY", "")
         if not self.api_key or not self.api_secret:
-            raise ValueError("❌ API keys not found in .env!")
+            raise ValueError("❌ API keys not found in .env")
 
-        self.loop = loop or asyncio.get_event_loop()
+        self.loop    = loop or asyncio.get_event_loop()
         self.session = HTTP(testnet=False, api_key=self.api_key, api_secret=self.api_secret)
 
-        # Initialize per-symbol trackers
-        self.trackers = {}
-        for symbol in SYMBOLS:
+        # Per-symbol trackers
+        self.trackers: dict[str, SymbolTracker] = {}
+        for sym in SYMBOLS:
             try:
-                info = self.session.get_instruments_info(category="linear", symbol=symbol)
-                inst = info['result']['list'][0]
-                tick_size = float(inst['priceFilter']['tickSize'])
-                qty_step = inst['lotSizeFilter']['qtyStep']
-                self.trackers[symbol] = SymbolTracker(symbol, tick_size, qty_step)
-                logger.info(f"✅ [{symbol}] tick={tick_size} | qty_step={qty_step}")
-            except Exception as e:
-                logger.error(f"❌ Failed to init {symbol}: {e}")
+                info = self.session.get_instruments_info(category="linear", symbol=sym)
+                inst = info["result"]["list"][0]
+                tick = float(inst["priceFilter"]["tickSize"])
+                step = inst["lotSizeFilter"]["qtyStep"]
+                self.trackers[sym] = SymbolTracker(sym, tick, step)
+                logger.info(f"✅ [{sym}] tick={tick} | qty_step={step}")
+            except Exception as exc:
+                logger.error(f"❌ Failed to init {sym}: {exc}")
 
+        if not self.trackers:
+            raise RuntimeError("No valid symbols initialised")
+
+        # State
         self.state = MultiPositionState()
         self.state.load_state()
 
-        self.symbol_cooldowns = {}  # symbol -> cooldown timestamp
-        self.ws = None
-        self.running = False
-        self.is_trading = False
-        self.cooldown_until = 0
-        self.loss_streak = 0
-        self.last_trade_time = 0
+        # Trading guards
+        self.symbol_cooldowns: dict[str, float] = {}   # symbol → resume timestamp
+        self.loss_streak       = 0
+        self.cooldown_until    = 0.0
+        self.last_trade_time   = 0.0
+        self.is_trading        = False
+        self.running           = False
         self._update_scheduled = False
-        self._indicator_counter = 0
+        self._indicator_tick   = 0
 
-    # --- WebSocket Handler ---
-    def handle_orderbook(self, message):
+        self.ws = None
+
+    # ── WebSocket callback (background thread) ───────────────
+    def handle_orderbook(self, message: dict):
         try:
-            symbol = message.get('topic', '').replace('orderbook.50.', '')
-            if symbol not in self.trackers:
+            topic  = message.get("topic", "")
+            symbol = topic.replace("orderbook.50.", "")
+            tracker = self.trackers.get(symbol)
+            if tracker is None:
                 return
 
-            tracker = self.trackers[symbol]
-            data = message.get('data', {})
-            tracker.update_orderbook(data.get('b', []), data.get('a', []))
+            data = message.get("data", {})
+            tracker.update_orderbook(data.get("b", []), data.get("a", []))
 
-            # Check TP/SL for open positions
+            # Update current price for unrealized PnL
             self.state.update_current_price(symbol, tracker.current_price)
-            self.state.check_tp_sl(symbol, tracker.best_bid, tracker.best_ask)
+
+            # Check TP / SL
+            pnl = self.state.check_tp_sl(symbol, tracker.best_bid, tracker.best_ask)
+            if pnl is not None:
+                if pnl < 0:
+                    self.loss_streak += 1
+                    self.symbol_cooldowns[symbol] = time.time() + SYMBOL_COOLDOWN
+                    logger.info(f"⏳ [{symbol}] Cooldown {SYMBOL_COOLDOWN}s after loss")
+                else:
+                    self.loss_streak = 0
 
             # Throttle async logic
             if not self._update_scheduled:
                 self._update_scheduled = True
-                async def wrapper():
-                    await self.on_tick()
-                    self._update_scheduled = False
-                asyncio.run_coroutine_threadsafe(wrapper(), self.loop)
 
-        except Exception as e:
-            logger.error(f"Orderbook handler error: {e}")
+                async def _wrapper():
+                    try:
+                        await self.on_tick()
+                    finally:
+                        self._update_scheduled = False
 
-    # --- Main Trading Logic ---
+                asyncio.run_coroutine_threadsafe(_wrapper(), self.loop)
+
+        except Exception as exc:
+            logger.error(f"Orderbook handler error: {exc}")
+
+    # ── Main trading logic (asyncio loop) ────────────────────
     async def on_tick(self):
         if not self.running or self.is_trading:
             return
@@ -487,141 +520,139 @@ class MultiSymbolBot:
         try:
             self.is_trading = True
 
-            # Update indicators every 10 ticks to save CPU
-            self._indicator_counter += 1
-            if self._indicator_counter % 10 == 0:
-                for tracker in self.trackers.values():
-                    tracker.update_indicators()
+            # Refresh indicators every 10 ticks
+            self._indicator_tick += 1
+            if self._indicator_tick % 10 == 0:
+                for t in self.trackers.values():
+                    t.refresh_indicators()
 
-            # Check balance
+            # Balance guard
             if self.state.balance < MIN_BALANCE:
                 logger.critical("💀 Balance too low. Halting.")
                 self.running = False
                 return
 
-            # Cooldown check
+            # Global loss-streak cooldown
             if self.loss_streak >= LOSS_STREAK_LIMIT:
-                logger.warning(f"⛔ {self.loss_streak} losses. Cooling down 10 min.")
+                logger.warning(f"⛔ {self.loss_streak} consecutive losses. Cooling down 10 min.")
                 self.cooldown_until = now + 600
-                self.loss_streak = 0
-                self.is_trading = False
+                self.loss_streak    = 0
+                self.is_trading     = False
                 return
 
-            # Scan all symbols for signals
+            # Scan symbols
             for symbol, tracker in self.trackers.items():
-                # Skip if symbol is in cooldown
-                if symbol in self.symbol_cooldowns and now < self.symbol_cooldowns[symbol]:
-                    continue
-
-                # Skip if already have position in this symbol
                 if symbol in self.state.positions:
                     continue
-
-                # Skip if max concurrent positions reached
-                if len(self.state.positions) >= MAX_CONCURRENT_POSITIONS:
+                if len(self.state.positions) >= MAX_CONCURRENT:
                     break
-
-                # Skip if spread too wide
+                if symbol in self.symbol_cooldowns and now < self.symbol_cooldowns[symbol]:
+                    continue
                 if tracker.spread > MAX_SPREAD:
+                    continue
+                if tracker.best_bid <= 0 or tracker.best_ask <= 0:
                     continue
 
                 signal = tracker.get_signal()
                 if signal is None:
                     continue
 
-                # Execute trade
                 entry_price = tracker.best_ask if signal == "Buy" else tracker.best_bid
                 tp_price, sl_price = tracker.calculate_tp_sl(signal, entry_price)
 
-                # Validate SL against market spread
-                if signal == "Sell":
-                    # For shorts, SL must be ABOVE best_ask (not just above entry)
-                    if sl_price <= tracker.best_ask:
-                        continue  # Skip, SL is inside spread
-                elif signal == "Buy":
-                    # For longs, SL must be BELOW best_bid
-                    if sl_price >= tracker.best_bid:
-                        continue
+                # ★ Spread guard: reject if SL is inside the spread
+                if not tracker.sl_is_valid(signal, sl_price):
+                    logger.warning(
+                        f"⛔ [{symbol}] Skipping {signal}: SL {sl_price} inside spread "
+                        f"(bid={tracker.best_bid}, ask={tracker.best_ask})"
+                    )
+                    continue
 
-                # Log signal
-                self._log_signal(symbol, tracker, signal)
-
+                # Lot sizing
                 notional = MAX_TRADE_SIZE * LEVERAGE
-                quantity = notional / entry_price
-                qty_dec = Decimal(str(quantity)).quantize(Decimal(str(tracker.qty_step)), rounding=ROUND_DOWN)
+                qty_raw  = notional / entry_price
+                qty_dec  = Decimal(str(qty_raw)).quantize(
+                    Decimal(str(tracker.qty_step)), rounding=ROUND_DOWN
+                )
                 quantity = float(qty_dec)
-
                 if quantity <= 0:
                     continue
 
-                self.state.open_position(symbol, signal, quantity, entry_price, tp_price, sl_price)
+                self._log_signal(symbol, tracker, signal)
+                self.state.open_position(
+                    symbol, signal, quantity, entry_price,
+                    tp_price, sl_price, tracker.tick_size,
+                )
                 self.last_trade_time = time.time()
-                self.loss_streak = 0
+                self.loss_streak     = 0
                 logger.success(f"✅ [{symbol}] {signal} executed!")
-                break  # One trade per tick
+                break  # one trade per tick
 
             self.is_trading = False
 
-        except Exception as e:
-            logger.error(f"Trading logic error: {e}")
+        except Exception as exc:
+            logger.error(f"Trading logic error: {exc}")
             self.is_trading = False
 
-    def _log_signal(self, symbol, tracker, signal):
-        SIGNAL_LOG.parent.mkdir(exist_ok=True, parents=True)
-        file_exists = SIGNAL_LOG.exists()
-        with open(SIGNAL_LOG, 'a', newline='') as f:
-            writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(['timestamp', 'symbol', 'signal', 'price', 'rsi', 'atr', 'sma', 'imbalance', 'spread'])
-            writer.writerow([
+    # ── Signal logging ───────────────────────────────────────
+    def _log_signal(self, symbol: str, tracker: SymbolTracker, signal: str):
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        exists = SIGNAL_LOG.exists()
+        with open(SIGNAL_LOG, "a", newline="") as fh:
+            w = csv.writer(fh)
+            if not exists:
+                w.writerow(["timestamp", "symbol", "signal", "price",
+                            "rsi", "atr", "sma", "imbalance", "spread"])
+            w.writerow([
                 datetime.now(timezone.utc).isoformat(), symbol, signal,
                 tracker.current_price, f"{tracker.last_rsi:.2f}",
                 f"{tracker.last_atr:.8f}", f"{tracker.last_sma:.8f}",
-                f"{tracker.last_imbalance:.4f}", f"{tracker.spread:.6f}"
+                f"{tracker.last_imbalance:.4f}", f"{tracker.spread:.6f}",
             ])
 
+    # ── Stats persistence ────────────────────────────────────
     def save_stats(self):
-        stats = self.state.get_stats()
-        PAPER_PNL_LOG.parent.mkdir(exist_ok=True, parents=True)
-        file_exists = PAPER_PNL_LOG.exists()
-
+        stats  = self.state.get_stats()
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        exists = PNL_LOG.exists()
         row = {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'balance': stats['balance'], 'equity': stats['equity'],
-            'total_pnl': stats['total_pnl'], 'win_rate': stats['win_rate'],
-            'total_trades': stats['total_trades'],
-            'open_positions': stats['open_positions'],
-            'max_drawdown': stats['max_drawdown'],
-            'profit_factor': stats['profit_factor'],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "balance": stats["balance"], "equity": stats["equity"],
+            "total_pnl": stats["total_pnl"], "win_rate": stats["win_rate"],
+            "total_trades": stats["total_trades"],
+            "open_positions": stats["open_positions"],
+            "max_drawdown": stats["max_drawdown"],
+            "profit_factor": stats["profit_factor"],
         }
-        with open(PAPER_PNL_LOG, 'a', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=row.keys())
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow(row)
+        with open(PNL_LOG, "a", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=row.keys())
+            if not exists:
+                w.writeheader()
+            w.writerow(row)
 
-    # --- WebSocket Setup ---
+    # ── WebSocket setup ──────────────────────────────────────
     def start_websocket(self):
         try:
-            self.ws = WebSocket(testnet=False, channel_type='linear',
-                                api_key=self.api_key, api_secret=self.api_secret)
-            for symbol in self.trackers:
-                self.ws.orderbook_stream(50, symbol=symbol, callback=self.handle_orderbook)
-                logger.info(f"🔌 Subscribed to {symbol} orderbook")
+            self.ws = WebSocket(
+                testnet=False, channel_type="linear",
+                api_key=self.api_key, api_secret=self.api_secret,
+            )
+            for sym in self.trackers:
+                self.ws.orderbook_stream(50, symbol=sym, callback=self.handle_orderbook)
+                logger.info(f"🔌 Subscribed to {sym}")
             logger.info("✅ All WebSocket streams active!")
-        except Exception as e:
-            logger.error(f"WebSocket init failed: {e}")
+        except Exception as exc:
+            logger.error(f"WebSocket init failed: {exc}")
             self.running = False
 
-    # --- Main Loop ---
+    # ── Main loop ────────────────────────────────────────────
     async def run(self):
-        logger.info(f"🚀 Multi-Symbol Bot: {', '.join(SYMBOLS)}")
-        logger.info(f"   Leverage: {LEVERAGE}x | Max Positions: {MAX_CONCURRENT_POSITIONS}")
+        logger.info(f"🚀 Multi-Symbol Bot: {', '.join(self.trackers)}")
+        logger.info(f"   Leverage: {LEVERAGE}x | Max Positions: {MAX_CONCURRENT}")
         logger.info(f"   Balance: ${self.state.balance:.2f}")
 
         self.running = True
-        ws_thread = threading.Thread(target=self.start_websocket, daemon=True)
-        ws_thread.start()
+        threading.Thread(target=self.start_websocket, daemon=True).start()
 
         while self.running:
             await asyncio.sleep(1)
@@ -629,26 +660,30 @@ class MultiSymbolBot:
                 stats = self.state.get_stats()
                 open_syms = list(self.state.positions.keys())
                 logger.info(
-                    f"💰 Bal: ${stats['balance']:.2f} | Equity: ${stats['equity']:.2f} | "
+                    f"💰 Bal: ${stats['balance']:.2f} | Eq: ${stats['equity']:.2f} | "
                     f"P&L: ${stats['total_pnl']:.2f} | Trades: {stats['total_trades']} | "
                     f"Open: {open_syms}"
                 )
                 self.save_stats()
-
                 if self.state.balance < MIN_BALANCE:
                     self.running = False
                     break
 
-        # Final report
-        stats = self.state.get_stats()
+        self._print_final()
+
+    def _print_final(self):
+        s = self.state.get_stats()
         logger.info("=" * 60)
         logger.info("📊 FINAL STATISTICS")
-        logger.info(f"   Trades: {stats['total_trades']} | Win Rate: {stats['win_rate']:.1f}%")
-        logger.info(f"   P&L: ${stats['total_pnl']:.2f} | Balance: ${stats['balance']:.2f}")
-        logger.info(f"   Max DD: {stats['max_drawdown']:.2f}% | PF: {stats['profit_factor']:.2f}")
+        logger.info(f"   Trades: {s['total_trades']} | Win Rate: {s['win_rate']:.1f}%")
+        logger.info(f"   P&L: ${s['total_pnl']:.2f} | Balance: ${s['balance']:.2f}")
+        logger.info(f"   Max DD: {s['max_drawdown']:.2f}% | PF: {s['profit_factor']:.2f}")
         logger.info("=" * 60)
 
 
+# ════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ════════════════════════════════════════════════════════════
 async def main():
     bot = MultiSymbolBot(loop=asyncio.get_running_loop())
     await bot.run()
@@ -658,5 +693,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("🛑 Stopped by user.")
-    except Exception as e:
-        logger.error(f"❌ Fatal: {e}")
+    except Exception as exc:
+        logger.error(f"❌ Fatal: {exc}")
