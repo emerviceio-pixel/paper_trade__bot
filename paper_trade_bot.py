@@ -205,7 +205,7 @@ class SymbolTracker:
         return None
 
     # ── TP / SL ──────────────────────────────────────────────
-     def calculate_tp_sl(self, side: str, entry_price: float) -> tuple[float, float]:
+    def calculate_tp_sl(self, side: str, entry_price: float) -> tuple[float, float]:
         min_dist    = self.tick_size * MIN_TICK_DIST
         spread_dist = self.best_ask - self.best_bid
         
