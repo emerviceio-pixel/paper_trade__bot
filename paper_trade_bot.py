@@ -196,8 +196,6 @@ class SymbolTracker:
             return None
         # Fee-drag filter: skip if volatility < round-trip fee cost
         if self.current_price > 0 and self.last_atr > 0:
-            if (self.last_atr / self.current_price) < (0.00055 * 2):
-                return None
         if self.last_rsi < RSI_BUY_THRESH and self.current_price > self.last_sma and self.last_imbalance > 0.55:
             return "Buy"
         if self.last_rsi > RSI_SELL_THRESH and self.current_price < self.last_sma and self.last_imbalance < 0.45:
